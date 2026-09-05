@@ -1,4 +1,4 @@
-"""Sample a validated H3 lookup at display-projection pixel centers."""
+"""Sample H3 values, retaining only the latest viewport mapping and raster."""
 
 import numpy as np
 import pandas as pd
@@ -16,6 +16,64 @@ def _bounds(bounds, fallback) -> tuple[float, float]:
     return tuple(map(float, bounds))
 
 
+class RasterSampler:
+    """A bounded cache: coordinate/level changes reuse geometry where possible."""
+
+    def __init__(self, projection, nx, ny):
+        self.projection, self.nx, self.ny = projection, nx, ny
+        self._mapping_key = None
+        self._raster_key = None
+        self._raster = None
+
+    def sample(self, values, grid, revision, x_range=None, y_range=None):
+        xmin, xmax = _bounds(x_range, self.projection.x_limits)
+        ymin, ymax = _bounds(y_range, self.projection.y_limits)
+        bounds = (xmin, ymin, xmax, ymax)
+        key = (bounds, grid.level if grid is not None else None)
+        raster_key = (key, revision)
+        if raster_key == self._raster_key:
+            return self._raster
+        if key != self._mapping_key:
+            x = xmin + (np.arange(self.nx) + 0.5) * (xmax - xmin) / self.nx
+            y = ymin + (np.arange(self.ny) + 0.5) * (ymax - ymin) / self.ny
+            positions = np.empty(0, dtype=int)
+            ids = np.empty(0, dtype=np.uint64)
+            if grid is not None:
+                xx, yy = np.meshgrid(x, y)
+                px, py = xx.ravel(), yy.ravel()
+                positions = np.flatnonzero(
+                    shapely.intersects_xy(self.projection.domain, px, py)
+                )
+                lonlat = ccrs.PlateCarree().transform_points(
+                    self.projection, px[positions], py[positions]
+                )
+                lon, lat = lonlat[:, 0], lonlat[:, 1]
+                valid = np.isfinite(lon) & np.isfinite(lat) & (np.abs(lat) <= 90)
+                positions = positions[valid]
+                if valid.any():
+                    ids = np.asarray(
+                        grid.geographic2cell_ids(lon[valid], lat[valid]),
+                        dtype=np.uint64,
+                    )
+            self._x, self._y, self._positions, self._ids = x, y, positions, ids
+            self._mapping_key = key
+        samples = np.full(
+            (self.nx * self.ny, len(values.columns)), np.nan, dtype=np.float64
+        )
+        if len(self._ids) and not values.empty:
+            samples[self._positions, :] = values.reindex(self._ids).to_numpy()
+        self._raster = xr.Dataset(
+            {
+                name: (("y", "x"), samples[:, i].reshape(self.ny, self.nx))
+                for i, name in enumerate(values.columns)
+            },
+            coords={"y": self._y, "x": self._x},
+            attrs={"bounds": bounds},
+        )
+        self._raster_key = raster_key
+        return self._raster
+
+
 def sample_raster(
     values: pd.DataFrame,
     grid: xdggs.H3Info | None,
@@ -25,33 +83,4 @@ def sample_raster(
     x_range=None,
     y_range=None,
 ) -> xr.Dataset:
-    xmin, xmax = _bounds(x_range, projection.x_limits)
-    ymin, ymax = _bounds(y_range, projection.y_limits)
-    x = xmin + (np.arange(nx) + 0.5) * (xmax - xmin) / nx
-    y = ymin + (np.arange(ny) + 0.5) * (ymax - ymin) / ny
-    samples = np.full((nx * ny, len(values.columns)), np.nan, dtype=np.float64)
-
-    if grid is not None and not values.empty:
-        xx, yy = np.meshgrid(x, y)
-        px, py = xx.ravel(), yy.ravel()
-        positions = np.flatnonzero(shapely.intersects_xy(projection.domain, px, py))
-        lonlat = ccrs.PlateCarree().transform_points(
-            projection, px[positions], py[positions]
-        )
-        lon, lat = lonlat[:, 0], lonlat[:, 1]
-        valid = np.isfinite(lon) & np.isfinite(lat) & (np.abs(lat) <= 90)
-        if valid.any():
-            ids = np.asarray(
-                grid.geographic2cell_ids(lon[valid], lat[valid]), dtype=np.uint64
-            )
-            # One mapping and one lookup for all variables. Zeros remain zeros.
-            samples[positions[valid], :] = values.reindex(ids).to_numpy()
-
-    return xr.Dataset(
-        {
-            name: (("y", "x"), samples[:, i].reshape(ny, nx))
-            for i, name in enumerate(values.columns)
-        },
-        coords={"y": y, "x": x},
-        attrs={"bounds": (xmin, ymin, xmax, ymax)},
-    )
+    return RasterSampler(projection, nx, ny).sample(values, grid, 0, x_range, y_range)

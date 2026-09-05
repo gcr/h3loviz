@@ -125,18 +125,16 @@ def test_duplicates_are_not_aggregated(frame):
         H3View(df, vdims=["value"])
 
 
-def test_coordinate_errors_and_empty_selection(frame):
+def test_coordinate_defaults_and_invalid_selection(frame):
     df = frame({"h3_cell_id": [CELL, CELL], "week": [1, 2], "value": [1.0, 2.0]})
-    with pytest.raises(ValueError, match="multiple values"):
-        H3View(df, vdims=["value"], coords=["week"])
+    default = H3View(df, vdims=["value"], coords=["week"])
+    assert default.select_coords == {"week": 1}
     with pytest.raises(ValueError, match="declared in coords"):
         H3View(df, vdims=["value"], selection={"week": 1})
     with pytest.raises(TypeError, match="scalar"):
         H3View(df, vdims=["value"], coords=["week"], selection={"week": [1]})
-    empty = H3View(df, vdims=["value"], coords=["week"], selection={"week": 99})
-    assert empty.df.empty
-    assert empty.h3_level is None
-    assert np.isnan(empty._sample_view().data["value"]).all()
+    with pytest.raises(ValueError, match="No rows match"):
+        H3View(df, vdims=["value"], coords=["week"], select_coords={"week": 99})
 
 
 def test_nullable_values(frame):
@@ -188,16 +186,15 @@ def test_nonnumeric_values(frame):
         H3View(df, vdims=["value"])
 
 
-def test_alias_and_assertion():
+def test_explicit_cell_and_assertion():
     df = pd.DataFrame({"custom": [CELL], "value": [1.0]})
-    with pytest.warns(DeprecationWarning):
-        view = H3View(df, h3_cell_column="custom", h3_level=4, vdims=["value"])
+    view = H3View(df, cell="custom", h3_level=4, vdims=["value"])
     assert view.cell == "custom"
-    with pytest.raises(ValueError, match="disagree"):
-        H3View(df, cell="custom", h3_cell_column="other", vdims=["value"])
+    with pytest.raises(ValueError, match="does not match"):
+        H3View(df, cell="custom", h3_level=3, vdims=["value"])
 
 
 def test_unsupported_inputs():
-    for df in (None, {"value": [1]}, pl.DataFrame({"value": [1]}).lazy()):
+    for df in ({"value": [1]}, pl.DataFrame({"value": [1]}).lazy()):
         with pytest.raises(TypeError, match="eager"):
             H3View(df, vdims=["value"])

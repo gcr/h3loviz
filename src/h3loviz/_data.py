@@ -80,6 +80,99 @@ def _resolve_cell(df, cell: str | None, is_pandas: bool) -> tuple[str | None, bo
     raise ValueError("No H3 column was recognized; specify cell= explicitly.")
 
 
+def snapshot_frame(df):
+    """Own the source across future selections without modifying the caller's frame."""
+    if isinstance(df, pd.DataFrame):
+        if not df.columns.is_unique:
+            raise ValueError("Dataframe column names must be unique.")
+        return df.copy(deep=True)
+    try:
+        import polars as pl
+    except ImportError:
+        pl = None
+    if pl is not None and isinstance(df, pl.DataFrame):
+        return df.clone()
+    raise TypeError(
+        "df must be an eager pandas or Polars DataFrame. "
+        "Materialize queries and lazy frames before passing them to H3View."
+    )
+
+
+def coordinate_table(df, coords: tuple[str, ...]) -> pd.DataFrame:
+    """Collect only observed coordinate combinations, never a Cartesian product."""
+    missing = set(coords) - set(df.columns)
+    if missing:
+        raise ValueError(f"Coordinate columns not found: {sorted(missing)!r}.")
+    if not coords:
+        return pd.DataFrame()
+    if isinstance(df, pd.DataFrame):
+        return df.loc[:, list(coords)].drop_duplicates().reset_index(drop=True)
+    unique = df.select(list(coords)).unique(maintain_order=True)
+    return pd.DataFrame({name: unique[name].to_list() for name in coords})
+
+
+def coordinate_values(table: pd.DataFrame, name: str) -> list[Any]:
+    values = [None if pd.isna(value) else value for value in table[name].unique()]
+    present = [value for value in values if value is not None]
+    try:
+        present = sorted(present)
+    except TypeError:
+        pass  # Mixed scalar types retain their order of appearance.
+    return present + ([None] if None in values else [])
+
+
+def _matching(table, name, value):
+    mask = table[name].isna() if pd.isna(value) else table[name].eq(value)
+    return table.loc[mask.fillna(False)]
+
+
+def choose_selection(
+    table: pd.DataFrame,
+    coords: tuple[str, ...],
+    previous: Mapping[str, Any],
+    explicit: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Honor explicit choices, retain compatible state, then choose valid defaults."""
+    unknown = set(explicit) - set(coords)
+    if unknown:
+        raise ValueError(
+            f"Selection keys must be declared in coords: {sorted(unknown)!r}."
+        )
+    for name, value in explicit.items():
+        if not pd.api.types.is_scalar(value):
+            raise TypeError(f"Selection for {name!r} must be a scalar.")
+    explicit = {
+        name: None if pd.isna(value) else value for name, value in explicit.items()
+    }
+    chosen = {name: value for name, value in previous.items() if name in coords}
+    chosen.update(explicit)
+    if table.empty:
+        return chosen
+    candidates = table
+    for name, value in explicit.items():
+        candidates = _matching(candidates, name, value)
+    if candidates.empty:
+        raise ValueError(
+            f"No rows match the explicit coordinate selection {dict(explicit)!r}."
+        )
+    for name in coords:
+        if name in explicit:
+            continue
+        retained = (
+            _matching(candidates, name, chosen[name])
+            if name in chosen
+            else candidates.iloc[:0]
+        )
+        if retained.empty:
+            chosen[name] = coordinate_values(candidates, name)[0]
+            retained = _matching(candidates, name, chosen[name])
+        candidates = retained
+    return {
+        name: None if pd.isna(candidates[name].iloc[0]) else candidates[name].iloc[0]
+        for name in coords
+    }
+
+
 def select_data(
     df: Any,
     *,
